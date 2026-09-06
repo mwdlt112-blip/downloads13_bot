@@ -3,8 +3,8 @@ const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const http = require('http');
 
-// 1. 全局防崩溃
-process.on('uncaughtException', (err) => console.error('🛡 全局异常:', err.message || err));
+// 1. 全局防崩溃守护
+process.on('uncaughtException', (err) => console.error('🛡 全局捕获异常:', err.message || err));
 process.on('unhandledRejection', (reason) => console.error('🛡 Promise异常:', reason?.message || reason));
 
 // 2. Render 保活 HTTP 服务
@@ -16,14 +16,21 @@ http.createServer((req, res) => {
     console.log(`🌐 保活服务运行于端口 ${PORT}`);
 });
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
-bot.catch((err) => console.error('🛡 Telegraf 异常:', err.message || err));
+// 3. 初始化 Telegraf（增加长轮询超时设置）
+const bot = new Telegraf(process.env.BOT_TOKEN, {
+    handlerTimeout: 90000
+});
+
+bot.catch((err) => console.error('🛡 Telegraf 内部异常:', err.message || err));
+
+// ================= 各平台解析引擎 =================
 
 // 【抖音解析】
 async function parseDouyin(url) {
     const redirectRes = await axios.get(url, {
         headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15' },
-        maxRedirects: 5
+        maxRedirects: 5,
+        timeout: 10000
     });
     const realUrl = redirectRes.request?.res?.responseUrl || url;
     const match = realUrl.match(/video\/(\d+)/) || realUrl.match(/note\/(\d+)/);
@@ -31,7 +38,8 @@ async function parseDouyin(url) {
 
     const itemId = match[1];
     const { data } = await axios.get(`https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids=${itemId}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)' }
+        headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)' },
+        timeout: 10000
     });
 
     const item = data.item_list?.[0];
@@ -62,7 +70,8 @@ async function parseKuaishou(url) {
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
             'Cookie': 'did=web_' + Math.random().toString(36).substring(2)
         },
-        maxRedirects: 5
+        maxRedirects: 5,
+        timeout: 10000
     });
 
     const html = resp.data;
@@ -71,7 +80,7 @@ async function parseKuaishou(url) {
     let videoUrl = null;
     let title = '快手分享';
 
-    if (match && match[1].startsWith('{')) {
+    if (match && match[1]?.startsWith('{')) {
         const pageModel = JSON.parse(match[1]);
         const photo = pageModel.photo || pageModel.item;
         videoUrl = photo?.mainMvUrls?.[0]?.url || photo?.photoUrl;
@@ -138,7 +147,8 @@ async function parseFacebook(url) {
     throw new Error('无法解析该 Facebook 视频，请确认其为公开视频');
 }
 
-// 指令与消息路由
+// ================= Telegram 消息处理与路由 =================
+
 bot.start((ctx) => {
     ctx.reply(
         `🎬 <b>多平台无水印媒体下载机器人</b>\n\n` +
@@ -210,8 +220,25 @@ bot.on('text', async (ctx) => {
     }
 });
 
-bot.launch().then(() => console.log('🤖 多平台媒体解析机器人已上线！'));
+// 4. 健壮的启动与重连循环
+async function startBotWithRetry(retries = 5, delay = 5000) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            console.log(`⏳ 正在尝试连接 Telegram 伺服器 (第 ${i + 1} 次)...`);
+            await bot.launch();
+            console.log('🤖 多平台媒体解析机器人已成功上线运行！');
+            return;
+        } catch (err) {
+            console.error(`⚠️ 连接失败: ${err.message}，将在 ${delay / 1000} 秒后重试...`);
+            if (i < retries - 1) {
+                await new Promise(res => setTimeout(res, delay));
+            }
+        }
+    }
+    console.error('❌ 多次重试连接 Telegram 失败，请检查 BOT_TOKEN 是否正确。');
+}
+
+startBotWithRetry();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
