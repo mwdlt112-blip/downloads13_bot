@@ -3,131 +3,89 @@ const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const http = require('http');
 
-// 1. 全局防崩溃守护
+// 1. 全局异常防崩溃
 process.on('uncaughtException', (err) => console.error('🛡 全局异常:', err.message || err));
 process.on('unhandledRejection', (reason) => console.error('🛡 Promise异常:', reason?.message || reason));
 
-// 2. Render 保活 HTTP 服务
+// 2. Render 保活 HTTP
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Media Bot Online\n');
+    res.end('Parser Bot Online\n');
 }).listen(PORT, () => {
-    console.log(`🌐 保活端口: ${PORT}`);
+    console.log(`🌐 保活监听端口: ${PORT}`);
 });
 
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 90000 });
 bot.catch((err) => console.error('🛡 Telegraf 异常:', err.message || err));
 
-// ================= 各平台工业级通道 =================
+// ================= 核心解析引擎 =================
 
-// 【1. 抖音解析（最新移动端网页 API + 网页重定向解包）】
-async function parseDouyin(rawUrl) {
-    // 方案 A：直接抓取官方移动端分享页状态
-    try {
-        const resp = await axios.get(rawUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-            },
-            maxRedirects: 5,
-            timeout: 10000
-        });
-
-        const html = resp.data;
-        // 匹配 _ROUTER_DATA 或者 RENDER_DATA
-        const matchData = html.match(/window\._ROUTER_DATA\s*=\s*(\{.+?\});<\/script>/) || 
-                          html.match(/<script id="RENDER_DATA" type="application\/json">(.+?)<\/script>/);
-
-        if (matchData) {
-            const rawJson = decodeURIComponent(matchData[1]);
-            const json = JSON.parse(rawJson);
-            const item = json?.loaderData?.['video_(id)/page']?.videoInfoRes?.item_list?.[0] || 
-                         json?.app?.videoInfoRes?.item_list?.[0];
-            
-            if (item) {
-                const title = item.desc || '抖音视频';
-                if (item.images && item.images.length > 0) {
-                    return { type: 'images', title, images: item.images.map(i => i.url_list[0]) };
-                }
-                const wmUrl = item.video?.play_addr?.url_list?.[0];
-                if (wmUrl) {
-                    return { type: 'video', title, videoUrl: wmUrl.replace('/playwm/', '/play/') };
-                }
-            }
-        }
-    } catch (e) {}
-
-    // 方案 B：TikWM 全球中继（TikWM 实际同时支持抖音与 TikTok！）
-    const resB = await axios.post('https://www.tikwm.com/api/', { url: rawUrl }, {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+// 【对接 dyxhsdownloader 的解析引擎（专攻抖音、快手）】
+async function parseViaDyXhs(rawText) {
+    // 伪装浏览器请求该平台的解析 API
+    const response = await axios.post('https://api.dyxhsdownloader.com/api/video/parse', {
+        url: rawText
+    }, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+            'Referer': 'https://dyxhsdownloader.com/',
+            'Origin': 'https://dyxhsdownloader.com',
+            'Content-Type': 'application/json'
+        },
         timeout: 15000
+    }).catch(async () => {
+        // 备用端点：部分镜像部署在根路由 /parse
+        return await axios.post('https://dyxhsdownloader.com/api/parse', {
+            url: rawText
+        }, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Referer': 'https://dyxhsdownloader.com/',
+                'Content-Type': 'application/json'
+            },
+            timeout: 15000
+        });
     });
-    const d = resB.data?.data;
-    if (d?.play) {
+
+    const res = response.data;
+    const data = res?.data || res;
+
+    if (!data) throw new Error('解析服务未返回有效数据');
+
+    const title = data.title || data.desc || '精彩无水印视频';
+
+    // 1. 图集类型
+    if (data.images && data.images.length > 0) {
         return {
-            type: d.images?.length ? 'images' : 'video',
-            title: d.title || '抖音视频',
-            videoUrl: d.play,
-            images: d.images
+            type: 'images',
+            title,
+            images: data.images.map(img => (typeof img === 'string' ? img : img.url || img.url_list?.[0]))
         };
     }
 
-    throw new Error('抖音链接解析失败，请检查是否为私密视频');
-}
-
-// 【2. 快手解析（双通道穿透）】
-async function parseKuaishou(rawUrl) {
-    // 方案 A：穿透并提取快手移动端直链
-    try {
-        const resp = await axios.get(rawUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15',
-                'Cookie': 'did=web_' + Math.random().toString(36).substring(2)
-            },
-            maxRedirects: 5,
-            timeout: 12000
-        });
-
-        const html = resp.data;
-        const matchVideo = html.match(/src="(https:\/\/[^"]+?\.mp4[^"]*?)"/) || 
-                           html.match(/"photoUrl":"(https:\/\/[^"]+?\.mp4[^"]*?)"/) ||
-                           html.match(/urlDefault":"(https:\/\/[^"]+?\.mp4[^"]*?)"/);
-
-        if (matchVideo) {
-            let videoUrl = matchVideo[1].replace(/\\u002F/g, '/');
-            return {
-                type: 'video',
-                title: '快手无水印视频',
-                videoUrl
-            };
-        }
-    } catch (e) {}
-
-    // 方案 B：快手全球中转节点
-    const resB = await axios.get(`https://api.lolimi.cn/api/video/kuaishou?url=${encodeURIComponent(rawUrl)}`, {
-        timeout: 15000
-    });
-    if (resB.data?.data?.video) {
+    // 2. 视频直链提取
+    const videoUrl = data.video_url || data.url || data.play_url || data.video;
+    if (videoUrl) {
         return {
             type: 'video',
-            title: resB.data.data.title || '快手无水印视频',
-            videoUrl: resB.data.data.video
+            title,
+            videoUrl
         };
     }
 
-    throw new Error('快手解析失败，接口暂时受限');
+    throw new Error('未能提取到无水印媒体直链');
 }
 
-// 【3. TikTok 解析（TikWM 引擎）】
-async function parseTikTok(rawUrl) {
-    const res = await axios.post('https://www.tikwm.com/api/', { url: rawUrl }, {
+// 【TikTok 稳定引擎】
+async function parseTikTok(url) {
+    const res = await axios.post('https://www.tikwm.com/api/', { url: url }, {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         timeout: 15000
     });
 
     const data = res.data?.data;
-    if (!data) throw new Error('TikTok 视频获取失败或已失效');
+    if (!data) throw new Error('TikTok 视频获取失败');
 
     const title = data.title || 'TikTok 视频';
     if (data.images && data.images.length > 0) {
@@ -137,62 +95,43 @@ async function parseTikTok(rawUrl) {
     return { type: 'video', title, videoUrl: data.play || data.wmplay };
 }
 
-// 【4. Facebook 解析（清洗 URL 后调用 FB 高画质接口）】
-async function parseFacebook(rawUrl) {
-    // 必须先把链接里的跟踪参数清洗掉，还原为规范 URL
-    const cleanUrl = rawUrl.split('?')[0];
+// 【Facebook 稳定引擎】
+async function parseFacebook(url) {
+    const cleanUrl = url.split('?')[0];
+    const res = await axios.get(`https://api.giftedtech.web.id/api/download/facebook?url=${encodeURIComponent(cleanUrl)}`, {
+        timeout: 15000
+    });
 
-    // 节点 1：FB 专用高画质解析网关
-    try {
-        const res = await axios.get(`https://api.vkrdown.com/fb/download.php?url=${encodeURIComponent(cleanUrl)}`, {
-            timeout: 15000
-        });
-        if (res.data?.data?.download_links?.length > 0) {
-            const links = res.data.data.download_links;
-            const best = links.find(l => l.quality === 'HD') || links[0];
-            return { type: 'video', title: 'Facebook 视频', videoUrl: best.url };
-        }
-    } catch (e) {}
-
-    // 节点 2：备用 SnapSave 穿透集群
-    try {
-        const res2 = await axios.get(`https://snapsave.fun/api/video?url=${encodeURIComponent(cleanUrl)}`, {
-            timeout: 15000
-        });
-        const vUrl = res2.data?.data?.hd || res2.data?.data?.sd;
-        if (vUrl) {
-            return { type: 'video', title: 'Facebook 视频', videoUrl: vUrl };
-        }
-    } catch (e) {}
-
-    throw new Error('Facebook 视频解析失败，请确保该视频为公开可见');
+    const video = res.data?.result?.hd || res.data?.result?.sd;
+    if (video) {
+        return { type: 'video', title: 'Facebook 视频', videoUrl: video };
+    }
+    throw new Error('Facebook 视频解析失败，请确认是否为公开视频');
 }
 
-// ================= 消息接收与处理 =================
+// ================= 消息路由与分发 =================
 
 bot.start((ctx) => {
     ctx.reply(
-        `🎬 <b>多平台无水印媒体下载助手</b>\n\n` +
-        `直接发送视频链接即可自动提取：\n` +
-        `▫️ <b>抖音</b> (视频/图集)\n` +
-        `▫️ <b>快手</b> (无水印视频)\n` +
-        `▫️ <b>TikTok</b> (高清原画)\n` +
-        `▫️ <b>Facebook</b> (公开视频)\n\n` +
-        `<i>支持直接粘贴整段文字分享！</i>`,
+        `🎬 <b>多平台去水印下载机器人</b>\n\n` +
+        `直接发送带链接的文字即可自动提取：\n` +
+        `▫️ <b>抖音 / 快手</b> (直连极速解析)\n` +
+        `▫️ <b>TikTok</b> (无水印视频/图集)\n` +
+        `▫️ <b>Facebook</b> (公开高清视频)\n\n` +
+        `<i>支持直接把 App 复制的全部文本粘贴发送！</i>`,
         { parse_mode: 'HTML' }
     ).catch(() => {});
 });
 
 bot.on('text', async (ctx) => {
-    const text = ctx.message.text.trim();
-    if (text.startsWith('/')) return;
+    const rawText = ctx.message.text.trim();
+    if (rawText.startsWith('/')) return;
 
-    // 精确剥离 URL（剔除末尾乱码与中文标点符号）
-    const match = text.match(/(https?:\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s\u4e00-\u9fa5]*)/);
+    // 提取消息中的 URL
+    const match = rawText.match(/(https?:\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s\u4e00-\u9fa5]*)/);
     if (!match) return;
 
-    // 清理 URL 尾部可能粘连的特殊字符（如 :3pm、/ 等）
-    let targetUrl = match[1].replace(/[:：;；，,。!！\)\s]+$/, '');
+    const targetUrl = match[1].replace(/[:：;；，,。!！\)\s]+$/, '');
     let statusMsg = null;
 
     try {
@@ -201,10 +140,10 @@ bot.on('text', async (ctx) => {
 
         let result = null;
 
-        if (targetUrl.includes('douyin.com') || targetUrl.includes('iesdouyin.com')) {
-            result = await parseDouyin(targetUrl);
-        } else if (targetUrl.includes('kuaishou.com') || targetUrl.includes('kwai.com')) {
-            result = await parseKuaishou(targetUrl);
+        // 抖音与快手统一走该平台的成熟解析网关
+        if (targetUrl.includes('douyin.com') || targetUrl.includes('iesdouyin.com') || 
+            targetUrl.includes('kuaishou.com') || targetUrl.includes('kwai.com')) {
+            result = await parseViaDyXhs(rawText);
         } else if (targetUrl.includes('tiktok.com')) {
             result = await parseTikTok(targetUrl);
         } else if (targetUrl.includes('facebook.com') || targetUrl.includes('fb.watch')) {
@@ -214,13 +153,14 @@ bot.on('text', async (ctx) => {
             return;
         }
 
-        // 发送结果
+        // 发送视频
         if (result.type === 'video') {
             await ctx.replyWithVideo(result.videoUrl, {
                 caption: `🎬 <b>${result.title}</b>\n\n✅ <i>无水印解析成功</i>`,
                 parse_mode: 'HTML'
             });
         } else if (result.type === 'images') {
+            // 发送图集
             const mediaGroup = result.images.slice(0, 10).map((img, idx) => ({
                 type: 'photo',
                 media: img,
@@ -246,13 +186,13 @@ bot.on('text', async (ctx) => {
     }
 });
 
-// 重试启动机制
+// 自动连接重试
 async function startBotWithRetry(retries = 5, delay = 5000) {
     for (let i = 0; i < retries; i++) {
         try {
-            console.log(`⏳ 连接 Telegram 伺服器 (第 ${i + 1} 次)...`);
+            console.log(`⏳ 连接 Telegram (第 ${i + 1} 次)...`);
             await bot.launch();
-            console.log('🤖 多平台媒体解析机器人已成功上线运行！');
+            console.log('🤖 机器人已成功上线！');
             return;
         } catch (err) {
             console.error(`⚠️ 连接失败: ${err.message}，${delay / 1000} 秒后重试...`);
